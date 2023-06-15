@@ -44,6 +44,7 @@ where
     pages: usize,
     sample_cb: Option<SampleCb<'b>>,
     lost_cb: Option<LostCb<'b>>,
+    wakeup_events: u32,
 }
 
 impl<'a, M> PerfBufferBuilder<'a, '_, M>
@@ -58,6 +59,7 @@ where
             pages: 64,
             sample_cb: None,
             lost_cb: None,
+            wakeup_events: 1,
         }
     }
 }
@@ -81,6 +83,7 @@ where
             pages: self.pages,
             sample_cb: Some(Box::new(cb)),
             lost_cb: self.lost_cb,
+            wakeup_events: self.wakeup_events,
         }
     }
 
@@ -96,6 +99,7 @@ where
             pages: self.pages,
             sample_cb: self.sample_cb,
             lost_cb: Some(Box::new(cb)),
+            wakeup_events: self.wakeup_events,
         }
     }
 
@@ -106,6 +110,18 @@ where
             pages,
             sample_cb: self.sample_cb,
             lost_cb: self.lost_cb,
+            wakeup_events: self.wakeup_events,
+        }
+    }
+
+    /// Minimum number of events before waking up.
+    pub fn wakeup_events(self, wakeup_events: u32) -> PerfBufferBuilder<'a, 'b, M> {
+        PerfBufferBuilder {
+            map: self.map,
+            pages: self.pages,
+            sample_cb: self.sample_cb,
+            lost_cb: self.lost_cb,
+            wakeup_events,
         }
     }
 
@@ -120,29 +136,32 @@ where
             return Err(Error::with_invalid_data("Page count must be power of two"));
         }
 
-        let c_sample_cb: libbpf_sys::perf_buffer_sample_fn = if self.sample_cb.is_some() {
-            Some(Self::call_sample_cb)
-        } else {
-            None
-        };
-
-        let c_lost_cb: libbpf_sys::perf_buffer_lost_fn = if self.lost_cb.is_some() {
-            Some(Self::call_lost_cb)
-        } else {
-            None
-        };
-
         let callback_struct_ptr = Box::into_raw(Box::new(CbStruct {
             sample_cb: self.sample_cb,
             lost_cb: self.lost_cb,
         }));
 
+        let mut attr = unsafe {
+            libbpf_sys::perf_event_attr {
+                type_: libbpf_sys::PERF_TYPE_SOFTWARE,
+                config: libbpf_sys::PERF_COUNT_SW_BPF_OUTPUT as u64,
+                sample_type: libbpf_sys::PERF_SAMPLE_RAW as u64,
+                __bindgen_anon_1: libbpf_sys::perf_event_attr__bindgen_ty_1 {
+                    sample_period: self.wakeup_events as u64,
+                },
+                __bindgen_anon_2: libbpf_sys::perf_event_attr__bindgen_ty_2 {
+                    wakeup_events: self.wakeup_events,
+                },
+                ..std::mem::zeroed()
+            }
+        };
+
         let ptr = unsafe {
-            libbpf_sys::perf_buffer__new(
+            libbpf_sys::perf_buffer__new_raw(
                 self.map.as_fd().as_raw_fd(),
                 self.pages,
-                c_sample_cb,
-                c_lost_cb,
+                std::ptr::addr_of_mut!(attr),
+                Some(Self::call_event_cb),
                 callback_struct_ptr.cast(),
                 ptr::null(),
             )
@@ -153,6 +172,53 @@ where
             _cb_struct: unsafe { Box::from_raw(callback_struct_ptr) },
         };
         Ok(pb)
+    }
+
+    #[deny(unsafe_op_in_unsafe_fn)]
+    unsafe extern "C" fn call_event_cb(
+        ctx: *mut c_void,
+        cpu: i32,
+        hdr: *mut libbpf_sys::perf_event_header,
+    ) -> i32 {
+        #[repr(C)]
+        struct perf_sample_raw {
+            header: libbpf_sys::perf_event_header,
+            size: u32,
+            data: [u8; 0],
+        }
+
+        #[repr(C)]
+        struct perf_sample_lost {
+            header: libbpf_sys::perf_event_header,
+            id: u64,
+            lost: u64,
+            sample_id: u64,
+        }
+
+        let perf_rec_type = unsafe { (*hdr).type_ };
+        match perf_rec_type {
+            libbpf_sys::PERF_RECORD_SAMPLE => {
+                let s = hdr as *mut perf_sample_raw;
+                unsafe {
+                    let event_sample = &mut *s;
+                    Self::call_sample_cb(
+                        ctx,
+                        cpu,
+                        std::ptr::addr_of_mut!(event_sample.data) as *mut c_void,
+                        event_sample.size,
+                    );
+                }
+            }
+            libbpf_sys::PERF_RECORD_LOST => {
+                let lost_event = hdr as *const perf_sample_lost;
+                unsafe {
+                    Self::call_lost_cb(ctx, cpu, (*lost_event).lost);
+                }
+            }
+            _ => return libbpf_sys::LIBBPF_PERF_EVENT_ERROR,
+        };
+
+        libbpf_sys::LIBBPF_PERF_EVENT_CONT
     }
 
     unsafe extern "C" fn call_sample_cb(ctx: *mut c_void, cpu: i32, data: *mut c_void, size: u32) {
@@ -183,10 +249,12 @@ where
             pages,
             sample_cb,
             lost_cb,
+            wakeup_events,
         } = self;
         f.debug_struct("PerfBufferBuilder")
             .field("map", map)
             .field("pages", pages)
+            .field("wakeup_events", wakeup_events)
             .field("sample_cb", &sample_cb.as_ref().map(|cb| &cb as *const _))
             .field("lost_cb", &lost_cb.as_ref().map(|cb| &cb as *const _))
             .finish()
