@@ -165,6 +165,7 @@ impl BpfObjBuilder {
         let mut linker = libbpf_rs::Linker::new(dst)
             .context("failed to instantiate libbpf object file linker")?;
 
+        let mut built_paths = vec![];
         let () = self.with_compiler_args(|compiler_args| {
             srcs.into_iter().try_for_each(|src| {
                 let src = src.as_ref();
@@ -179,19 +180,27 @@ impl BpfObjBuilder {
                     .with_context(|| format!("failed to compile `{}`", src.display()))?;
 
                 linker
-                    .add_file(tmp_dst)
+                    .add_file(&tmp_dst)
                     .context("failed to add object file to BPF linker")?;
+                built_paths.push(tmp_dst);
                 Ok(())
             })
         })?;
 
-        // The resulting object file may contain DWARF information
-        // that references system specific and temporary paths. That
-        // can render our generated skeletons unstable, potentially
-        // making them unsuitable for inclusion in version control
-        // systems. Linking has the side effect of stripping this
-        // information.
-        linker.link().context("failed to link object file")?;
+        if std::env::var_os("BPF_DEBUG").is_some() {
+            if built_paths.len() != 1 {
+                bail!("BPF_DEBUG currently supports only single input files");
+            }
+            std::fs::rename(built_paths[0].as_path(), dst).context("failed to move built BPF object")?;
+        } else {
+            // The resulting object file may contain DWARF information
+            // that references system specific and temporary paths. That
+            // can render our generated skeletons unstable, potentially
+            // making them unsuitable for inclusion in version control
+            // systems. Linking has the side effect of stripping this
+            // information.
+            linker.link().context("failed to link object file")?;
+        }
 
         Ok(())
     }
