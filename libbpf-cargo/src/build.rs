@@ -27,6 +27,7 @@ use crate::metadata::UnprocessedObj;
 pub(crate) struct BpfObjBuilder {
     compiler: PathBuf,
     compiler_args: Vec<OsString>,
+    bpf_target: String,
 }
 
 impl BpfObjBuilder {
@@ -49,6 +50,12 @@ impl BpfObjBuilder {
         self
     }
 
+    /// Specify the BPF target triple for clang (e.g., "bpf", "bpfeb", "bpfel").
+    pub fn bpf_target<S: AsRef<str>>(&mut self, target: S) -> &mut Self {
+        self.bpf_target = target.as_ref().to_string();
+        self
+    }
+
     /// We're essentially going to run:
     /// ```text
     /// clang -g -O2 -target bpf -c -D__TARGET_ARCH_$(ARCH) runqslower.bpf.c -o runqslower.bpf.o
@@ -60,6 +67,7 @@ impl BpfObjBuilder {
         dst: &Path,
         compiler: &Path,
         compiler_args: &[OsString],
+        bpf_target: &str,
     ) -> Result<()> {
         debug!("Building {}", src.display());
 
@@ -69,7 +77,7 @@ impl BpfObjBuilder {
         cmd.arg("-g")
             .arg("-O2")
             .arg("-target")
-            .arg("bpf")
+            .arg(bpf_target)
             .arg("-c")
             .arg(src.as_os_str())
             .arg("-o")
@@ -176,8 +184,14 @@ impl BpfObjBuilder {
                     )
                 })?);
 
-                let () = Self::compile_single(src, &tmp_dst, &self.compiler, compiler_args)
-                    .with_context(|| format!("failed to compile `{}`", src.display()))?;
+                let () = Self::compile_single(
+                    src,
+                    &tmp_dst,
+                    &self.compiler,
+                    compiler_args,
+                    &self.bpf_target,
+                )
+                .with_context(|| format!("failed to compile `{}`", src.display()))?;
 
                 linker
                     .add_file(&tmp_dst)
@@ -191,7 +205,8 @@ impl BpfObjBuilder {
             if built_paths.len() != 1 {
                 bail!("BPF_DEBUG currently supports only single input files");
             }
-            std::fs::rename(built_paths[0].as_path(), dst).context("failed to move built BPF object")?;
+            std::fs::rename(built_paths[0].as_path(), dst)
+                .context("failed to move built BPF object")?;
         } else {
             // The resulting object file may contain DWARF information
             // that references system specific and temporary paths. That
@@ -216,6 +231,7 @@ impl Default for BpfObjBuilder {
         Self {
             compiler: "clang".into(),
             compiler_args: Vec::new(),
+            bpf_target: "bpf".into(),
         }
     }
 }
@@ -307,6 +323,7 @@ pub fn build_project(
     manifest_path: Option<&Path>,
     clang: Option<&Path>,
     clang_args: Vec<OsString>,
+    bpf_target: Option<&str>,
 ) -> Result<()> {
     let (_target_dir, to_compile) = metadata::get(manifest_path)?;
 
@@ -337,17 +354,19 @@ pub fn build_project(
         dest_path.push(&dest_name);
         fs::create_dir_all(&obj.out)?;
 
-        BpfObjBuilder::default()
-            .compiler(&clang)
-            .compiler_args(&clang_args)
-            .build(&obj.path, &dest_path)
-            .with_context(|| {
-                format!(
-                    "failed to compile `{}` into `{}`",
-                    obj.path.display(),
-                    dest_path.display()
-                )
-            })
+        let mut builder = BpfObjBuilder::default();
+        builder.compiler(&clang);
+        if let Some(target) = bpf_target {
+            builder.bpf_target(target);
+        }
+        builder.compiler_args(&clang_args);
+        builder.build(&obj.path, &dest_path).with_context(|| {
+            format!(
+                "failed to compile `{}` into `{}`",
+                obj.path.display(),
+                dest_path.display()
+            )
+        })
     })?;
 
     Ok(())

@@ -18,11 +18,12 @@ pub fn make(
     manifest_path: Option<&Path>,
     clang: Option<&Path>,
     clang_args: Vec<OsString>,
+    bpf_target: Option<&str>,
     cargo_build_args: Vec<String>,
     rustfmt_path: Option<&Path>,
 ) -> Result<()> {
     debug!("Compiling BPF objects");
-    build::build_project(manifest_path, clang, clang_args)
+    build::build_project(manifest_path, clang, clang_args, bpf_target)
         .context("Failed to compile BPF objects")?;
 
     debug!("Generating skeletons");

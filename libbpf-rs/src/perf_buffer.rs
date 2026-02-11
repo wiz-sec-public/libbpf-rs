@@ -2,6 +2,7 @@ use core::ffi::c_void;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
+use std::mem;
 use std::os::unix::prelude::AsRawFd;
 use std::ptr;
 use std::ptr::NonNull;
@@ -115,7 +116,7 @@ where
     }
 
     /// Minimum number of events before waking up.
-    pub fn wakeup_events(self, wakeup_events: u32) -> PerfBufferBuilder<'a, 'b, M> {
+    pub fn wakeup_events(self, wakeup_events: u32) -> Self {
         PerfBufferBuilder {
             map: self.map,
             pages: self.pages,
@@ -152,7 +153,7 @@ where
                 __bindgen_anon_2: libbpf_sys::perf_event_attr__bindgen_ty_2 {
                     wakeup_events: self.wakeup_events,
                 },
-                ..std::mem::zeroed()
+                ..mem::zeroed()
             }
         };
 

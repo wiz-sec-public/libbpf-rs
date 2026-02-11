@@ -101,6 +101,7 @@ pub struct SkeletonBuilder {
     obj: Option<PathBuf>,
     clang: Option<PathBuf>,
     clang_args: Vec<OsString>,
+    bpf_target: Option<String>,
     rustfmt: PathBuf,
     dir: Option<TempDir>,
     reference_obj: bool,
@@ -121,6 +122,7 @@ impl SkeletonBuilder {
             obj: None,
             clang: None,
             clang_args: Vec::new(),
+            bpf_target: None,
             rustfmt: "rustfmt".into(),
             dir: None,
             reference_obj: false,
@@ -177,6 +179,15 @@ impl SkeletonBuilder {
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
             .collect();
+        self
+    }
+
+    /// Specify the BPF target triple for clang (e.g., "bpf", "bpfeb", "bpfel").
+    ///
+    /// Default is "bpf" (little-endian). Use "bpfeb" for big-endian architectures
+    /// like s390x.
+    pub fn bpf_target<S: AsRef<str>>(&mut self, target: S) -> &mut Self {
+        self.bpf_target = Some(target.as_ref().to_string());
         self
     }
 
@@ -288,6 +299,9 @@ impl SkeletonBuilder {
         let mut builder = BpfObjBuilder::default();
         if let Some(clang) = &self.clang {
             builder.compiler(clang);
+        }
+        if let Some(target) = &self.bpf_target {
+            builder.bpf_target(target);
         }
         builder.compiler_args(&self.clang_args);
 
