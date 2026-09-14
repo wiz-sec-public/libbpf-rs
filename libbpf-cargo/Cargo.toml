@@ -28,6 +28,8 @@ path = "src/lib.rs"
 # By default the crate uses a vendored libbpf, but requires other
 # necessary libs to be present on the system.
 default = ["libbpf-rs/default"]
+# Allow skeletons to embed zstd-compressed BPF objects.
+zstd = ["dep:zstd", "libbpf-rs/zstd"]
 
 [dependencies]
 anyhow = "1.0.40"
@@ -40,12 +42,14 @@ serde_json = "1.0"
 tempfile = "3.3"
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "chrono", "fmt"] }
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 goblin = "0.9"
 indoc = "2"
 test-fork = "0.1"
 test-log = { version = "0.2.16", default-features = false, features = ["trace"] }
+test-tag = "0.1"
 vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "991dd4b8dfd8c9d62ce8999521b24f61d9b7fc52" }
 
 [lints]

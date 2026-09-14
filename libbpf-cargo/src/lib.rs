@@ -12,6 +12,11 @@
 //! The following sections in this document describe the `cargo-libbpf` plugin. See the API
 //! reference for documentation on the build script interface.
 //!
+//! With the `zstd` feature, `SkeletonBuilder::compress_obj` can reduce embedded
+//! BPF object size. Generated skeletons also require the `libbpf-rs/zstd` feature.
+//! Objects are decompressed when opened, and the temporary buffer is freed
+//! before the skeleton is returned to the caller.
+//!
 //! # Configuration
 //!
 //! cargo-libbpf consumes the following Cargo.toml configuration options:
@@ -105,6 +110,7 @@ pub struct SkeletonBuilder {
     rustfmt: PathBuf,
     dir: Option<TempDir>,
     reference_obj: bool,
+    compress_obj: bool,
     original_obj_name: Option<String>,
 }
 
@@ -126,6 +132,7 @@ impl SkeletonBuilder {
             rustfmt: "rustfmt".into(),
             dir: None,
             reference_obj: false,
+            compress_obj: false,
             original_obj_name: None,
         }
     }
@@ -217,6 +224,24 @@ impl SkeletonBuilder {
     /// Default is `false` (inline bytes, self-contained skeleton).
     pub fn reference_obj(&mut self, reference: bool) -> &mut Self {
         self.reference_obj = reference;
+        self
+    }
+
+    /// Compress the embedded BPF object with zstd at level 19.
+    ///
+    /// The generated skeleton requires the `zstd` feature of `libbpf-rs`.
+    /// Opening it decompresses the object into a temporary buffer, which is
+    /// freed once libbpf has read the ELF contents, before loading or attaching.
+    /// The original object file is left uncompressed for debugging and tooling.
+    ///
+    /// With [`reference_obj`](Self::reference_obj), a compressed companion file
+    /// with `.zst` appended to the object path must also remain available when
+    /// rustc compiles the skeleton. Otherwise, compressed bytes are inlined.
+    ///
+    /// Default is `false` (embed the uncompressed object).
+    #[cfg(feature = "zstd")]
+    pub fn compress_obj(&mut self, compress: bool) -> &mut Self {
+        self.compress_obj = compress;
         self
     }
 
@@ -322,6 +347,7 @@ impl SkeletonBuilder {
             Some(&self.rustfmt),
             self.reference_obj,
             self.original_obj_name.as_deref(),
+            self.compress_obj,
         )
         .with_context(|| format!("failed to generate `{}`", objfile.display()))?;
 

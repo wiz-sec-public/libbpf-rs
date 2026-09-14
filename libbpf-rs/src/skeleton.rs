@@ -42,10 +42,54 @@ struct ProgSkelConfig {
     link: Box<*mut bpf_link>,
 }
 
+#[derive(Debug)]
+enum ObjectData<'dat> {
+    Borrowed(&'dat [u8]),
+    #[cfg(feature = "zstd")]
+    Mapped(memmap2::MmapMut),
+}
+
+impl AsRef<[u8]> for ObjectData<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(data) => data,
+            #[cfg(feature = "zstd")]
+            Self::Mapped(data) => data,
+        }
+    }
+}
+
+/// Discard only whole pages within the supplied read-only file mapping.
+///
+/// The caller must ensure that discarded bytes can be restored from the file.
+#[cfg(all(feature = "zstd", target_os = "linux"))]
+unsafe fn discard_file_backed_data(data: &[u8]) {
+    // SAFETY: sysconf does not access any caller-provided memory.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return;
+    }
+    let page_size = page_size as usize;
+    let skip = (data.as_ptr() as usize).wrapping_neg() % page_size;
+    let len = data.len().saturating_sub(skip) / page_size * page_size;
+    if len != 0 {
+        // SAFETY: This range contains only complete pages within data. The
+        // caller guarantees that refaulting them restores their contents.
+        // Failure to discard pages must not prevent opening the BPF object.
+        unsafe {
+            libc::madvise(
+                data.as_ptr().add(skip).cast_mut().cast(),
+                len,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+
 #[expect(missing_docs)]
 #[derive(Debug)]
 pub struct ObjectSkeletonConfigBuilder<'dat> {
-    data: &'dat [u8],
+    data: ObjectData<'dat>,
     obj: Box<*mut bpf_object>,
     name: Option<String>,
     maps: Vec<MapSkelConfig>,
@@ -69,12 +113,60 @@ impl<'dat> ObjectSkeletonConfigBuilder<'dat> {
     /// stored/retrieved
     pub fn new(object_data: &'dat [u8]) -> Self {
         Self {
-            data: object_data,
+            data: ObjectData::Borrowed(object_data),
             obj: Box::new(ptr::null_mut()),
             name: None,
             maps: Vec::new(),
             progs: Vec::new(),
         }
+    }
+
+    /// Decompress a zstd object into an anonymous mapping owned by this builder.
+    ///
+    /// `uncompressed_size` bounds the allocation and must match the original
+    /// ELF size. Corrupt frames and size mismatches return an error.
+    /// Opening the skeleton unmaps this buffer, returning its resident pages
+    /// directly to the OS instead of leaving them in the allocator's cache.
+    #[cfg(feature = "zstd")]
+    pub fn from_zstd(object_data: &[u8], uncompressed_size: usize) -> Result<Self> {
+        if uncompressed_size == 0 {
+            return Err(Error::with_invalid_data("BPF object must not be empty"));
+        }
+        let mut data = memmap2::MmapMut::map_anon(uncompressed_size)?;
+        let size = zstd::bulk::decompress_to_buffer(object_data, &mut data)?;
+        if size != uncompressed_size {
+            return Err(Error::with_invalid_data(
+                "Decompressed BPF object size mismatch",
+            ));
+        }
+        let mut builder = Self::new(&[]);
+        builder.data = ObjectData::Mapped(data);
+        Ok(builder)
+    }
+
+    /// Decompress a zstd object embedded in a read-only file mapping.
+    ///
+    /// On Linux, also discard the compressed input's resident pages after
+    /// decompression. Partial pages at the boundaries are left untouched.
+    /// Opening the skeleton again faults the original bytes back in.
+    ///
+    /// # Safety
+    ///
+    /// `object_data` must be backed by an immutable file, such as a read-only
+    /// section of the executable. It must not refer to heap or anonymous memory,
+    /// or pages with private modifications that would be lost when discarded.
+    #[cfg(feature = "zstd")]
+    pub unsafe fn from_zstd_embedded(
+        object_data: &'static [u8],
+        uncompressed_size: usize,
+    ) -> Result<Self> {
+        let builder = Self::from_zstd(object_data, uncompressed_size)?;
+        #[cfg(target_os = "linux")]
+        // SAFETY: The caller guarantees that the input can be refaulted from its file.
+        unsafe {
+            discard_file_backed_data(object_data);
+        }
+        Ok(builder)
     }
 
     #[expect(missing_docs)]
@@ -195,8 +287,8 @@ impl<'dat> ObjectSkeletonConfigBuilder<'dat> {
         }
 
         // libbpf_sys will use it as const despite the signature
-        s.data = self.data.as_ptr() as *mut c_void;
-        s.data_sz = self.data.len() as c_ulong;
+        s.data = self.data.as_ref().as_ptr() as *mut c_void;
+        s.data_sz = self.data.as_ref().len() as c_ulong;
 
         // Give s ownership over the box
         s.obj = Box::into_raw(self.obj);
@@ -223,6 +315,8 @@ impl<'dat> ObjectSkeletonConfigBuilder<'dat> {
 /// * free any allocated memory on drop
 ///
 /// This struct can be moved around at will. Upon drop, all allocated resources will be freed
+/// except the BPF object, which belongs to the generated skeleton's `OpenObject` or `Object`.
+/// [`Self::open`] releases the ELF buffer after libbpf has read its contents.
 #[derive(Debug)]
 pub struct ObjectSkeletonConfig<'dat> {
     inner: bpf_object_skeleton,
@@ -232,13 +326,47 @@ pub struct ObjectSkeletonConfig<'dat> {
     maps_layout: Option<Layout>,
     /// Same as above
     progs_layout: Option<Layout>,
-    /// Hold this reference so that compiler guarantees buffer lives as long as us
-    _data: &'dat [u8],
+    /// Keep the ELF bytes alive until libbpf has finished opening the object.
+    _data: ObjectData<'dat>,
     /// Hold strings alive so pointers to them stay valid
     _string_pool: Vec<CString>,
 }
 
 impl ObjectSkeletonConfig<'_> {
+    /// Open the skeleton and release its ELF buffer on success.
+    ///
+    /// The opened BPF object must be taken into an `OpenObject` by the caller.
+    /// This config does not own that object. A second open returns an error.
+    ///
+    /// # Safety
+    ///
+    /// `opts` must be null or point to valid libbpf open options, including any
+    /// pointers stored within the options, for the duration of this call.
+    pub unsafe fn open(&mut self, opts: *const libbpf_sys::bpf_object_open_opts) -> Result<()> {
+        // SAFETY: `build` allocates the object pointer and keeps it alive.
+        if !unsafe { *self.inner.obj }.is_null() {
+            return Err(Error::with_invalid_data("Skeleton is already open"));
+        }
+        // SAFETY: All skeleton storage is owned by self; opts is valid by contract.
+        let ret = unsafe { libbpf_sys::bpf_object__open_skeleton(&mut self.inner, opts) };
+        if ret != 0 {
+            // libbpf can fail to populate maps or programs after opening the
+            // object. No OpenObject exists yet to close it in that case.
+            unsafe {
+                libbpf_sys::bpf_object__close(*self.inner.obj);
+                *self.inner.obj = ptr::null_mut();
+            }
+            return Err(Error::from_raw_os_error(-ret));
+        }
+
+        // libbpf finishes ELF parsing in bpf_object_open; load and attach only
+        // use the resulting object, maps and programs, not these input bytes.
+        self.inner.data = ptr::null_mut();
+        self.inner.data_sz = 0;
+        self._data = ObjectData::Borrowed(&[]);
+        Ok(())
+    }
+
     /// Returns the `mmaped` pointer for a map at the specified `index`.
     ///
     /// The index is determined by the order in which the map was passed to
@@ -396,4 +524,92 @@ pub trait Skel<'obj> {
 
     /// Get a mutable reference to [`Object`].
     fn object_mut(&mut self) -> &mut Object;
+}
+
+#[cfg(all(test, feature = "zstd"))]
+mod tests {
+    use super::ObjectSkeletonConfigBuilder;
+    use std::ptr;
+
+    #[test]
+    fn compressed_object_rejects_corruption_and_size_mismatches() {
+        let data = b"BPF object data";
+        let compressed = zstd::bulk::compress(data, 19).unwrap();
+        let builder = ObjectSkeletonConfigBuilder::from_zstd(&compressed, data.len()).unwrap();
+        assert_eq!(builder.data.as_ref(), data);
+        assert!(ObjectSkeletonConfigBuilder::from_zstd(b"invalid", data.len()).is_err());
+        assert!(ObjectSkeletonConfigBuilder::from_zstd(
+            &compressed[..compressed.len() / 2],
+            data.len(),
+        )
+        .is_err());
+        assert!(ObjectSkeletonConfigBuilder::from_zstd(&compressed, data.len() - 1).is_err());
+        assert!(ObjectSkeletonConfigBuilder::from_zstd(&compressed, data.len() + 1).is_err());
+        assert!(ObjectSkeletonConfigBuilder::from_zstd(&compressed, 0).is_err());
+    }
+
+    #[test]
+    fn compressed_object_rejects_invalid_elf() {
+        let data = b"not an ELF";
+        let compressed = zstd::bulk::compress(data, 19).unwrap();
+        let mut builder = ObjectSkeletonConfigBuilder::from_zstd(&compressed, data.len()).unwrap();
+        builder.name("invalid_bpf");
+        let mut config = builder.build().unwrap();
+        // SAFETY: Null opts selects libbpf defaults.
+        assert!(unsafe { config.open(ptr::null()) }.is_err());
+        // SAFETY: The config owns the object pointer storage.
+        assert!(unsafe { *config.inner.obj }.is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_fork::fork]
+    #[test]
+    fn decompressed_object_is_unmapped_on_drop() {
+        // SAFETY: sysconf does not access caller-provided memory.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let data = vec![42; page_size * 2];
+        let compressed = zstd::bulk::compress(&data, 19).unwrap();
+        let builder = ObjectSkeletonConfigBuilder::from_zstd(&compressed, data.len()).unwrap();
+        let addr = builder.data.as_ref().as_ptr().cast_mut().cast();
+        let mut residency = [0u8; 2];
+        // SAFETY: The mapping is page aligned, and residency has one byte per page.
+        assert_eq!(
+            unsafe { libc::mincore(addr, data.len(), residency.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(residency, [1, 1]);
+        drop(builder);
+        // SAFETY: mincore queries virtual addresses without dereferencing them.
+        assert_eq!(
+            unsafe { libc::mincore(addr, data.len(), residency.as_mut_ptr()) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOMEM)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discard_preserves_partial_pages_and_refaults_file_contents() {
+        use std::io::Write;
+
+        // SAFETY: sysconf does not access caller-provided memory.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let data = vec![42; page_size * 5];
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&data).unwrap();
+        // SAFETY: This test owns the file, and it is not modified while mapped.
+        let mut mapping = unsafe { memmap2::MmapOptions::new().map_copy(&file) }.unwrap();
+        mapping[0] = 1;
+        mapping[data.len() - 1] = 2;
+        assert_eq!(&mapping[1..data.len() - 1], &data[1..data.len() - 1]);
+        // SAFETY: Only the complete interior pages are discarded, and they
+        // contain unmodified file data. The modified boundary pages must survive.
+        unsafe { super::discard_file_backed_data(&mapping[1..data.len() - 1]) };
+        assert_eq!(mapping[0], 1);
+        assert_eq!(mapping[data.len() - 1], 2);
+        assert_eq!(&mapping[1..data.len() - 1], &data[1..data.len() - 1]);
+    }
 }

@@ -24,6 +24,8 @@ default = ["libbpf-sys/vendored-libbpf"]
 static = ["libbpf-sys/static"]
 # Use vendored versions of all required libraries.
 vendored = ["libbpf-sys/vendored"]
+# Support skeletons containing zstd-compressed BPF objects.
+zstd = ["dep:memmap2", "dep:zstd"]
 
 # Below here are dev-mostly features that should not be needed by
 # regular users.
@@ -42,7 +44,9 @@ name = "test"
 bitflags = "2.0"
 libbpf-sys = { version = "1.7.0", default-features = false }
 libc = "0.2"
+memmap2 = { version = "0.9", optional = true }
 vsprintf = "2.0"
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [build-dependencies]
 libbpf-sys = { version = "1.7.0", default-features = false, optional = true }

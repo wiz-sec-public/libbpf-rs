@@ -1,5 +1,8 @@
 0.26.2
 ------
+- Decompress zstd skeleton objects into temporary anonymous mappings so opening
+  the object releases their resident pages immediately
+- Added support for discarding embedded compressed object pages on Linux
 - Added `ProgramMut::assoc_struct_ops` for associating non-struct_ops programs
   with struct_ops maps
 - Added `IterOpts::None` variant for `attach_iter_with_opts()`

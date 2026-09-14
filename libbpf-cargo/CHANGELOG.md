@@ -1,5 +1,7 @@
 0.26.2
 ------
+- Generated compressed skeletons discard their embedded object's resident pages
+  on Linux after decompression
 - Included `missing-docs` lint suppression on generated skeleton
 - Updated `libbpf-sys` dependency to `1.7.0`
 

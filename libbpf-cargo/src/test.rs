@@ -1275,6 +1275,176 @@ fn test_skeleton_builder_default_inlines_bytes() {
     assert!(skel.contains("127, 69, 76, 70"));
 }
 
+#[cfg(feature = "zstd")]
+const COMPRESSED_BPF_SOURCE: &str = indoc! {r#"
+    #include "vmlinux.h"
+    #include <bpf/bpf_helpers.h>
+
+    const volatile unsigned int answer = 42;
+
+    SEC("socket")
+    int answer_packet(struct __sk_buff *ctx)
+    {
+        return answer;
+    }
+    char LICENSE[] SEC("license") = "GPL";
+"#};
+
+/// Exercise both embedding modes, including compilation and opening the result.
+#[cfg(feature = "zstd")]
+#[test]
+fn test_skeleton_compressed_embedding() {
+    let (_dir, proj_dir, cargo_toml) = setup_temp_project();
+    let source = proj_dir.join("src/prog.bpf.c");
+    let obj = proj_dir.join("src/prog.bpf.o");
+    let skel = proj_dir.join("src/skel.rs");
+    // Keep the compressed input larger than several pages so repeated opens
+    // exercise discarding and refaulting the embedded bytes.
+    let mut state = 1u32;
+    let padding = (0..32768)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as u8).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    write(
+        &source,
+        format!("{COMPRESSED_BPF_SOURCE}\nconst volatile unsigned char padding[] = {{{padding}}};"),
+    )
+    .unwrap();
+    write_vmlinux_header(&proj_dir.join("src"));
+    let mut cargo = OpenOptions::new().append(true).open(&cargo_toml).unwrap();
+    writeln!(
+        cargo,
+        "libbpf-rs = {{ path = {:?}, features = [\"zstd\"] }}",
+        get_libbpf_rs_path(),
+    )
+    .unwrap();
+    write(
+        proj_dir.join("src/main.rs"),
+        indoc! {r#"
+            mod skel;
+            use std::mem::MaybeUninit;
+            use libbpf_rs::skel::{OpenSkel, SkelBuilder};
+
+            fn main() {
+                for _ in 0..3 {
+                    let mut object = MaybeUninit::uninit();
+                    let skel = skel::ProgSkelBuilder::default().open(&mut object).unwrap();
+                    assert_eq!(skel.open_object().progs().count(), 1);
+                    assert_eq!(skel.maps.rodata_data.as_ref().unwrap().answer, 42);
+                }
+            }
+        "#},
+    )
+    .unwrap();
+
+    for reference in [false, true] {
+        SkeletonBuilder::new()
+            .source(&source)
+            .obj(&obj)
+            .compress_obj(true)
+            .reference_obj(reference)
+            .build_and_generate(&skel)
+            .unwrap();
+        let original = read(&obj).unwrap();
+        let generated = read_to_string(&skel).unwrap();
+        assert_eq!(generated.contains("include_bytes!"), reference);
+        let target = proj_dir.join("target");
+        let status = Command::new("cargo")
+            .args(["run", "--quiet", "--manifest-path"])
+            .arg(&cargo_toml)
+            .arg("--target-dir")
+            .arg(&target)
+            .env("RUSTFLAGS", "-Dwarnings")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let binary = read(target.join("debug/proj")).unwrap();
+        let elf = goblin::elf::Elf::parse(&binary).unwrap();
+        let section = elf
+            .section_headers
+            .iter()
+            .find(|s| &elf.shdr_strtab[s.sh_name] == ".bpf.objs")
+            .unwrap();
+        let embedded =
+            &binary[section.sh_offset as usize..(section.sh_offset + section.sh_size) as usize];
+        assert!(embedded.len() < original.len());
+        assert_eq!(
+            zstd::bulk::decompress(embedded, original.len()).unwrap(),
+            original,
+        );
+        if reference {
+            assert_eq!(read(proj_dir.join("src/prog.bpf.o.zst")).unwrap(), embedded);
+        }
+    }
+}
+
+/// Check the buffer lifetime against libbpf and the kernel, including global data.
+#[cfg(feature = "zstd")]
+#[test_tag::tag(root)]
+#[test]
+#[ignore = "requires root or CAP_BPF to load and execute a BPF program"]
+fn test_skeleton_compressed_load_after_buffer_release() {
+    use libbpf_rs::__internal_skel::ObjectSkeletonConfigBuilder;
+    use libbpf_rs::AsRawLibbpf;
+    use libbpf_rs::OpenObject;
+    use libbpf_rs::ProgramInput;
+    use std::ptr;
+    use std::ptr::NonNull;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("prog.bpf.c");
+    let obj = dir.path().join("prog.bpf.o");
+    write(&source, COMPRESSED_BPF_SOURCE).unwrap();
+    write_vmlinux_header(dir.path());
+    SkeletonBuilder::new()
+        .source(&source)
+        .obj(&obj)
+        .build()
+        .unwrap();
+    let original = read(&obj).unwrap();
+    let compressed = zstd::bulk::compress(&original, 19).unwrap();
+    let mut invalid = ObjectSkeletonConfigBuilder::from_zstd(&compressed, original.len()).unwrap();
+    invalid.name("prog_bpf").map("missing_map", false);
+    let mut invalid = invalid.build().unwrap();
+    // SAFETY: Null opts selects libbpf defaults. An unknown map fails after ELF parsing.
+    assert!(unsafe { invalid.open(ptr::null()) }.is_err());
+    // SAFETY: The config owns the object pointer storage, which must be cleared on failure.
+    assert!(unsafe { (*invalid.as_libbpf_object().as_ref().obj).is_null() });
+    drop(invalid);
+
+    let mut builder = ObjectSkeletonConfigBuilder::from_zstd(&compressed, original.len()).unwrap();
+    builder.name("prog_bpf");
+    let mut config = builder.build().unwrap();
+    // SAFETY: Null opts selects libbpf defaults.
+    unsafe { config.open(ptr::null()) }.unwrap();
+    // SAFETY: The config keeps the skeleton and object pointer storage alive.
+    let raw = unsafe { config.as_libbpf_object().as_ref() };
+    assert!(raw.data.is_null());
+    assert_eq!(raw.data_sz, 0);
+    // SAFETY: A successful open gives ownership of this object to the caller.
+    let object = unsafe { OpenObject::from_ptr(NonNull::new(*raw.obj).unwrap()) };
+    assert!(unsafe { config.open(ptr::null()) }.is_err());
+    drop(original);
+    drop(compressed);
+    let object = object.load().unwrap();
+    let prog = object.progs_mut().next().unwrap();
+    let packet = [0u8; 64];
+    let mut packet_out = [0u8; 64];
+    let output = prog
+        .test_run(ProgramInput {
+            data_in: Some(&packet),
+            data_out: Some(&mut packet_out),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(output.return_value, 42);
+}
+
 /// Check that we generate a valid skeleton in the presence of duplicate
 /// structs in the BTF.
 #[test]

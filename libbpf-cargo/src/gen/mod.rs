@@ -10,12 +10,14 @@ use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::fmt::Write as fmt_write;
 use std::fs::File;
+use std::fs::write;
 use std::io::stdout;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::mem::size_of;
 use std::os::raw::c_ulong;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::ptr;
@@ -332,13 +334,25 @@ fn maps(object: &Object) -> impl Iterator<Item = Map<'_>> {
         .map(|ptr| unsafe { Map::from_map_without_fd(ptr) })
 }
 
-fn gen_skel_c_skel_constructor(skel: &mut String, object: &Object, name: &str) -> Result<()> {
+fn gen_skel_c_skel_constructor(
+    skel: &mut String,
+    object: &Object,
+    name: &str,
+    uncompressed_size: Option<usize>,
+) -> Result<()> {
+    let constructor = match uncompressed_size {
+        Some(size) => format!(
+            "// SAFETY: DATA is embedded in a read-only section of the executable.\n\
+             unsafe {{ libbpf_rs::__internal_skel::ObjectSkeletonConfigBuilder::from_zstd_embedded(&DATA, {size})? }}"
+        ),
+        None => "libbpf_rs::__internal_skel::ObjectSkeletonConfigBuilder::new(&DATA)".to_string(),
+    };
     write!(
         skel,
         "\
         fn build_skel_config() -> libbpf_rs::Result<libbpf_rs::__internal_skel::ObjectSkeletonConfig<'static>>
         {{
-            let mut builder = libbpf_rs::__internal_skel::ObjectSkeletonConfigBuilder::new(&DATA);
+            let mut builder = {constructor};
             builder
                 .name(\"{name}\")
         ",
@@ -831,7 +845,12 @@ fn gen_skel_struct_ops_init(object: &Object) -> Result<String> {
 }
 
 /// Generate contents of a single skeleton
-fn gen_skel_contents(raw_obj_name: &str, obj_file_path: &Path, obj_ref: bool) -> Result<String> {
+fn gen_skel_contents(
+    raw_obj_name: &str,
+    obj_file_path: &Path,
+    obj_ref: bool,
+    compress_obj: bool,
+) -> Result<String> {
     let mut skel = String::new();
 
     write!(
@@ -883,11 +902,30 @@ fn gen_skel_contents(raw_obj_name: &str, obj_file_path: &Path, obj_ref: bool) ->
     let maps = MapsData::new(&object)?;
     let progs = ProgsData::new(&object)?;
 
-    gen_skel_c_skel_constructor(&mut skel, &object, &libbpf_obj_name)?;
+    gen_skel_c_skel_constructor(
+        &mut skel,
+        &object,
+        &libbpf_obj_name,
+        compress_obj.then_some(mmap.len()),
+    )?;
     gen_skel_map_defs(&mut skel, &maps, raw_obj_name, true)?;
     gen_skel_map_defs(&mut skel, &maps, raw_obj_name, false)?;
     gen_skel_open_prog_defs(&mut skel, &progs, raw_obj_name)?;
     gen_skel_prog_defs(&mut skel, &progs, raw_obj_name)?;
+
+    let open_skel = if compress_obj {
+        "let mut skel_config = build_skel_config()?;
+         // SAFETY: open_opts is valid for the duration of open_opts_impl.
+         unsafe { skel_config.open(open_opts)?; }
+         let skel_ptr = skel_config.as_libbpf_object();"
+    } else {
+        "let skel_config = build_skel_config()?;
+         let skel_ptr = skel_config.as_libbpf_object();
+         let ret = unsafe { libbpf_sys::bpf_object__open_skeleton(skel_ptr.as_ptr(), open_opts) };
+         if ret != 0 {
+             return Err(libbpf_rs::Error::from_raw_os_error(-ret));
+         }"
+    };
 
     #[allow(clippy::uninlined_format_args)]
     write!(
@@ -942,13 +980,7 @@ fn gen_skel_contents(raw_obj_name: &str, obj_file_path: &Path, obj_ref: bool) ->
                 open_opts: *const libbpf_sys::bpf_object_open_opts,
                 object: &'obj mut std::mem::MaybeUninit<libbpf_rs::OpenObject>,
             ) -> libbpf_rs::Result<Open{name}Skel<'obj>> {{
-                let skel_config = build_skel_config()?;
-                let skel_ptr = skel_config.as_libbpf_object();
-
-                let ret = unsafe {{ libbpf_sys::bpf_object__open_skeleton(skel_ptr.as_ptr(), open_opts) }};
-                if ret != 0 {{
-                    return Err(libbpf_rs::Error::from_raw_os_error(-ret));
-                }}
+                {open_skel}
 
                 // SAFETY: `skel_ptr` points to a valid object after the
                 //         open call.
@@ -1164,20 +1196,38 @@ pub struct StructOps {{}}
     gen_skel_struct_ops_getters(&mut skel, &object)?;
     writeln!(skel, "}}")?;
 
+    let bytes: Cow<'_, [u8]> = if compress_obj {
+        #[cfg(feature = "zstd")]
+        {
+            Cow::Owned(zstd::bulk::compress(&mmap, 19).context("Failed to compress BPF object")?)
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            bail!("BPF object compression requires the zstd feature");
+        }
+    } else {
+        Cow::Borrowed(&mmap)
+    };
     writeln!(skel, "#[unsafe(link_section = \".bpf.objs\")]")?;
     if obj_ref {
-        let obj_file_path = obj_file_path
-            .canonicalize()
-            .unwrap_or_else(|_| obj_file_path.to_path_buf());
+        let path = if compress_obj {
+            let mut path = obj_file_path.as_os_str().to_os_string();
+            path.push(".zst");
+            let path = PathBuf::from(path);
+            write(&path, &bytes)
+                .with_context(|| format!("Failed to write compressed object `{}`", path.display()))?;
+            path
+        } else {
+            obj_file_path.to_path_buf()
+        };
+        let path = path.canonicalize().unwrap_or(path);
         writeln!(
             skel,
-            "static DATA: [u8; {}] = *include_bytes!(\"{path}\");",
-            mmap.len(),
-            path = obj_file_path.display(),
+            "static DATA: [u8; {}] = *include_bytes!({path:?});",
+            bytes.len(),
         )?;
     } else {
-        // Coerce to &[u8] just to be safe, as we'll be using debug formatting
-        let bytes: &[u8] = &mmap;
+        let bytes = bytes.as_ref();
         writeln!(skel, "static DATA: [u8; {}] = {bytes:?};", bytes.len())?;
     }
     writeln!(skel, "}}")?;
@@ -1192,10 +1242,11 @@ fn gen_skel(
     out: OutputDest<'_>,
     rustfmt_path: Option<&Path>,
     obj_ref: bool,
+    compress_obj: bool,
 ) -> Result<()> {
     ensure!(!name.is_empty(), "Object file has no name");
 
-    let skel = gen_skel_contents(name, obj, obj_ref)?;
+    let skel = gen_skel_contents(name, obj, obj_ref, compress_obj)?;
     let skel = try_rustfmt(&skel, rustfmt_path)?;
 
     match out {
@@ -1264,6 +1315,7 @@ pub(crate) fn gen_single(
     rustfmt_path: Option<&Path>,
     obj_ref: bool,
     original_name: Option<&str>,
+    compress_obj: bool,
 ) -> Result<()> {
     let filename = match obj_file.file_name() {
         Some(n) => n,
@@ -1292,7 +1344,7 @@ pub(crate) fn gen_single(
         }
     };
 
-    let () = gen_skel(name, obj_file, output, rustfmt_path, obj_ref).with_context(|| {
+    let () = gen_skel(name, obj_file, output, rustfmt_path, obj_ref, compress_obj).with_context(|| {
         format!(
             "Failed to generate skeleton for {}",
             obj_file.to_string_lossy(),
@@ -1329,6 +1381,7 @@ fn gen_project(manifest_path: Option<&Path>, rustfmt_path: Option<&Path>) -> Res
             OutputDest::Directory(skel_path.as_path()),
             rustfmt_path,
             false,
+            false,
         )
         .with_context(|| {
             format!(
@@ -1364,7 +1417,7 @@ pub fn generate(
     }
 
     if let Some(obj_file) = object {
-        gen_single(obj_file, OutputDest::Stdout, rustfmt_path, false, None)
+        gen_single(obj_file, OutputDest::Stdout, rustfmt_path, false, None, false)
     } else {
         gen_project(manifest_path, rustfmt_path)
     }
